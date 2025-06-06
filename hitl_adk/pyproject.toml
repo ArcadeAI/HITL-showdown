@@ -1,12 +1,12 @@
 [project]
-name = "oai-agents-arcade"
+name = "hitl-adk"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "agentops>=0.4.12",
-    "agents-arcade>=0.0.3",
-    "openai-agents>=0.0.6",
-    "python-dotenv>=1.1.0",
+    "agentops>=0.4.14",
+    "arcade-ai>=1.0.1",
+    "google-adk>=1.0.0",
+    "litellm>=1.70.4",
 ]

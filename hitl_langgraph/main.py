@@ -3,23 +3,26 @@ import os
 # Import necessary classes and modules
 from typing import Callable, Any
 from langchain_arcade import ToolManager
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool, BaseTool
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import (END, START, MessagesState,
-                             StateGraph)
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import create_react_agent
+from langgraph_supervisor import create_supervisor
 from langgraph.types import interrupt, Command
 
 from utils.hitl_commons import yes_no_loop
-
+# import agentops
 import pprint
 
 from dotenv import load_dotenv
 
+
 load_dotenv()
+
+AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
+# agentops.init(tags=["hitl-google-adk"])
 
 arcade_api_key = os.environ["ARCADE_API_KEY"]
 
@@ -60,61 +63,10 @@ def add_human_in_the_loop(
     return call_tool_with_interrupt
 
 
-# Initialize the tool manager and fetch tools
-manager = ToolManager(api_key=arcade_api_key)
-manager.init_tools(toolkits=["Google"])
-
-# convert to langchain tools and use interrupts for auth
-tools = manager.to_langchain(use_interrupts=True)
-
-tools = [add_human_in_the_loop(t) for t in tools]
-
-# Initialize the prebuilt tool node
-tool_node = ToolNode(tools)
-
-# Create a language model instance and bind it with the tools
-model = ChatOpenAI(model="gpt-4o")
-model_with_tools = model.bind_tools(tools)
-
-
-# Function to invoke the model and get a response
-def call_agent(state: MessagesState):
-    messages = state["messages"]
-    response = model_with_tools.invoke(messages)
-    # Return the updated message history
-    return {"messages": [response]}
-
-
-# Function to determine the next step in the workflow based on the last message
-def should_continue(state: MessagesState):
-    if state["messages"][-1].tool_calls:
-        for tool_call in state["messages"][-1].tool_calls:
-            if manager.requires_auth(tool_call["name"]):
-                return "authorization"
-        return "tools"  # Proceed to tool execution if no authorization is needed
-    return END  # End the workflow if no tool calls are present
-
-
-# Function to handle authorization for tools that require it
-def authorize(state: MessagesState, config: dict):
-    user_id = config["configurable"].get("user_id")
-    for tool_call in state["messages"][-1].tool_calls:
-        tool_name = tool_call["name"]
-        if not manager.requires_auth(tool_name):
-            continue
-        auth_response = manager.authorize(tool_name, user_id)
-        if auth_response.status != "completed":
-            # Prompt the user to visit the authorization URL
-            print(f"Visit the following URL to authorize: {auth_response.url}")
-
-            # wait for the user to complete the authorization
-            # and then check the authorization status again
-            manager.wait_for_auth(auth_response.id)
-            if not manager.is_authorized(auth_response.id):
-                # node interrupt?
-                raise ValueError("Authorization failed")
-
-    return {"messages": []}
+ENFORCE_HUMAN_CONFIRMATION = [
+    "Google_SendEmail",
+    "Slack_SendDmToUser",
+]
 
 
 def run_graph(graph: CompiledStateGraph, config, input: Any):
@@ -131,29 +83,67 @@ def handle_interrupts(graph: CompiledStateGraph, config):
 
 
 if __name__ == "__main__":
-    # Build the workflow graph using StateGraph
-    workflow = StateGraph(MessagesState)
-
-    # Add nodes (steps) to the graph
-    workflow.add_node("agent", call_agent)
-    workflow.add_node("tools", tool_node)
-    workflow.add_node("authorization", authorize)
-
-    # Define the edges and control flow between nodes
-    workflow.add_edge(START, "agent")
-    workflow.add_conditional_edges("agent",
-                                   should_continue,
-                                   ["authorization", "tools", END])
-    workflow.add_edge("authorization", "tools")
-    workflow.add_edge("tools", "agent")
-
+    user_id = "mateo@arcade.dev"
+    config = {"configurable": {"thread_id": "4",
+                               "user_id": user_id}}
     # Set up memory for checkpointing the state
     memory = MemorySaver()
 
-    # Compile the graph with the checkpointer
-    graph = workflow.compile(checkpointer=memory)
+    # Initialize google tools
+    manager = ToolManager(api_key=arcade_api_key)
+    manager.init_tools(tools=["Google_ListEmails", "Google_SendEmail",
+                              "Slack_ListUsers", "Slack_SendDmToUser"])
 
-    config = {"configurable": {"thread_id": "4", "user_id": "mateo@arcade.dev"}}
+    for t in manager.tools:
+        manager.authorize(tool_name=t, user_id=user_id)
+
+    # separate tools for multiple agents
+    google_tools = []
+    slack_tools = []
+    for t in manager.to_langchain(use_interrupts=True):
+        print(t.name)
+        if t.name.startswith("Google"):
+            if t.name in ENFORCE_HUMAN_CONFIRMATION:
+                print(f"Adding hitl to {t.name}")
+                google_tools.append(add_human_in_the_loop(t))
+            else:
+                google_tools.append(t)
+        if t.name.startswith("Slack"):
+            if t.name in ENFORCE_HUMAN_CONFIRMATION:
+                print(f"Adding hitl to {t.name}")
+                slack_tools.append(add_human_in_the_loop(t))
+            else:
+                slack_tools.append(t)
+
+    google_agent = create_react_agent(
+        model="openai:gpt-4o",
+        tools=google_tools,
+        prompt="You are a helpful assistant that can assist using tools"
+               " to manage a Google account, contacts, and inbox.",
+        name="google_agent"
+    )
+
+    slack_agent = create_react_agent(
+        model="openai:gpt-4o",
+        tools=slack_tools,
+        prompt="You are a helpful assistant that can assist using tools"
+               " to interact with Slack."
+               " You have tools to manage channels and send DMs.",
+        name="slack_agent"
+    )
+
+    conversation_agent = create_supervisor(
+        model=init_chat_model("openai:gpt-4o"),
+        agents=[google_agent, slack_agent],
+        prompt="You are a helpful assistant that can help with everyday"
+               " tasks. You can handoff to another agent with access to"
+               " Gmail tools if needed. You can also handoff to an agent"
+               " with Slack tools if needed. Handoff to the appropriate"
+               " agent based on the services required.",
+        add_handoff_back_messages=True,
+        output_mode="full_history",
+    ).compile(checkpointer=memory)
+
     while True:
 
         user_input = input("User: ")
@@ -161,7 +151,7 @@ if __name__ == "__main__":
             break
 
         user_message = {"messages": [{"role": "user", "content": user_input}]}
-        run_graph(graph, config, user_message)
+        run_graph(conversation_agent, config, user_message)
 
         # handle all interrupts in case there's any
-        handle_interrupts(graph, config)
+        handle_interrupts(conversation_agent, config)

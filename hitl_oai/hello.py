@@ -1,17 +1,21 @@
 from agents import (Agent, Runner, AgentHooks, Tool, RunContextWrapper,
-                    TResponseInputItem,
-                    trace, set_tracing_export_api_key)
+                    TResponseInputItem,)
 from functools import partial
-from agents_arcade.errors import AuthorizationError
 from arcadepy import AsyncArcade
 from agents_arcade import get_arcade_tools
 from typing import Any
-from jit_permissions.tools import UserDeniedToolCall, confirm_tool_usage
+from jit_permissions.tools import (UserDeniedToolCall,
+                                   confirm_tool_usage,
+                                   auth_tool)
 
 import dotenv
 import os
+import agentops
 dotenv.load_dotenv()
-set_tracing_export_api_key(os.environ["OPENAI_API_KEY"])
+
+AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
+
+agentops.init(tags="arcade")
 
 ENFORCE_HUMAN_CONFIRMATION = [
     "Google_SendEmail",
@@ -80,7 +84,6 @@ async def main():
 
     context = {
         "user_id": "mateo@arcade.dev",
-        "email": "mateo@arcade.dev",
     }
 
     client = AsyncArcade()
@@ -90,13 +93,16 @@ async def main():
     slack_tools = await get_arcade_tools(
         client, tools=["Slack_ListUsers", "Slack_SendDmToUser"])
 
-    for t in google_tools + slack_tools:
-        if t.name in ENFORCE_HUMAN_CONFIRMATION:
-            t.on_invoke_tool = partial(
+    for tool in google_tools + slack_tools:
+        # - human in the loop
+        if tool.name in ENFORCE_HUMAN_CONFIRMATION:
+            tool.on_invoke_tool = partial(
                 confirm_tool_usage,
-                tool_name=t.name,
-                callback=t.on_invoke_tool,
+                tool_name=tool.name,
+                callback=tool.on_invoke_tool,
             )
+        # - auth
+        await auth_tool(client, tool.name, user_id=context["user_id"])
 
     google_agent = Agent(
         name="Google Agent",
@@ -119,7 +125,7 @@ async def main():
         hooks=CustomAgentHooks(display_name="Slack Agent"),
     )
 
-    triage_agent = Agent(
+    conversation_agent = Agent(
         name="conversation_agent",
         instructions="You are a helpful assistant that can help with everyday"
                      " tasks. You can handoff to another agent with access to"
@@ -131,56 +137,37 @@ async def main():
         hooks=CustomAgentHooks(display_name="Conversation Agent")
     )
 
-    google_agent.handoffs.extend([triage_agent, slack_agent])
-    slack_agent.handoffs.extend([triage_agent, google_agent])
+    google_agent.handoffs.extend([conversation_agent, slack_agent])
+    slack_agent.handoffs.extend([conversation_agent, google_agent])
 
+    # initialize the conversation
     history: list[TResponseInputItem] = []
-    try:
-        with trace("Arcade Agent SDK demo"):
-            while True:
-                # prompt = input("What would you like me to do?\n")
-                # if len(history) == 0:
-                #     prompt = ("get my latest 5 emails. Then summarize them."
-                #               " Then send me (Mateo) a direct message on Slack"
-                #               " that includes the summaries")
-                #     history.append({"role": "user", "content": prompt})
-                # else:
-                #     prompt = input("You: ")
-                #     if prompt.lower() == "exit":
-                #         exit(0)
-
-                prompt = input("You: ")
-                if prompt.lower() == "exit":
-                    exit(0)
-                history.append({"role": "user", "content": prompt})
-                try:
-                    result = await Runner.run(
-                        starting_agent=triage_agent,
-                        input=history,
-                        context=context
-                    )
-                    history = result.to_input_list()
-                    print("Assistant:", result.final_output)
-                except UserDeniedToolCall as e:
-                    history.extend([
-                        {
-                            "role": "assistant",
-                            "content": f"Please confirm the call to {e.message}"
-                        },
-                        {
-                            "role": "user",
-                            "content": "I changed my mind, please don't do it."
-                        },
-                        {
-                            "role": "assistant",
-                            "content": f"Ok, I won't call {e.message} now."
-                            " What else can I do for you?"
-                        }
-                    ])
-                    print(history[-1]["content"])
-    except AuthorizationError as e:
-        print("Please Login to service:", e)
-
+    # run the loop!
+    while True:
+        prompt = input("You: ")
+        if prompt.lower() == "exit":
+            break
+        history.append({"role": "user", "content": prompt})
+        try:
+            result = await Runner.run(
+                starting_agent=conversation_agent,
+                input=history,
+                context=context
+            )
+            history = result.to_input_list()
+            print(result.final_output)
+        except UserDeniedToolCall as e:
+            history.extend([
+                {"role": "assistant",
+                 "content": f"Please confirm the call to {e.tool_name}"},
+                {"role": "user",
+                 "content": "I changed my mind, please don't do it!"},
+                {"role": "assistant",
+                 "content": f"Sure, I cancelled the call to {e.tool_name}."
+                 " What else can I do for you today?"
+                 },
+            ])
+            print(history[-1]["content"])
 
 if __name__ == "__main__":
     import asyncio

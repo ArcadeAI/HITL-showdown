@@ -1,22 +1,19 @@
 from arcadepy import AsyncArcade
-from agents import AgentsException, RunContextWrapper
+from google.adk.tools import ToolContext
+from google_adk_arcade.tools import ArcadeTool
 from pprint import pp
-import json
+from typing import Any
 
 
-class UserDeniedToolCall(AgentsException):
-    """Exception raised when an user denies a tool call"""
-
-    message: str
-
-    def __init__(self, message: str):
-        self.message = message
+ENFORCE_HUMAN_CONFIRMATION = [
+    "Google_SendEmail",
+    "Slack_SendDmToUser",
+]
 
 
-async def confirm_tool_usage(context: RunContextWrapper,
-                             tool_args: str,
-                             tool_name: str,
-                             callback) -> str:
+async def confirm_tool_usage(tool: ArcadeTool,
+                             args: Any,
+                             tool_context: ToolContext) -> None | str:
     """
     Ask the user to confirm the use of a specific tool
 
@@ -27,17 +24,27 @@ async def confirm_tool_usage(context: RunContextWrapper,
         callable: the function that we should call if approved
 
     Returns:
-        str: The output of the tool call
+        None | str:
+            None if the user approved the tool call, allowing the agent to
+            continue
+
+            A string with a denial message that will be passed to the LLM
+            in case the user does not approve the tool call
     """
+    # only applicable to tools we want to enforce confirmation for
+    if tool.name not in ENFORCE_HUMAN_CONFIRMATION:
+        return
     print("\nThe agent requires permission:\n"
-          f"I'm about to call {tool_name} with these arguments:")
-    pp(json.loads(tool_args))
+          f"I'm about to call {tool.name} with these arguments:")
+    # pp(json.loads(args))
+    pp(args)
     clarification = input("Your response [y/n]: ")
     while clarification.lower() not in ["y", "n"]:
         clarification = input("Your response (must be either y or n): ")
     if clarification.lower() == "y":
-        return await callback(context, tool_args)
-    raise UserDeniedToolCall(tool_name)
+        return
+    return (f"The user denied permission to call {tool.name}"
+            " with these arguments")
 
 
 async def auth_tool(client: AsyncArcade, tool_name: str, user_id: str):
